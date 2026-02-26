@@ -196,6 +196,219 @@ async function detectTaskMasterFolder(projectPath) {
 
 // Cache for extracted project directories
 const projectDirectoryCache = new Map();
+const CODEX_SUMMARY_MAX_LENGTH = 50;
+const CLOUDCLI_DIR = path.join(os.homedir(), '.cloudcli');
+const CODEX_TITLE_MAP_PATH = path.join(CLOUDCLI_DIR, 'codex-session-titles.json');
+const CODEX_TITLE_MAP_VERSION = 1;
+const CODEX_VSCODE_STATE_KEY = 'openai.chatgpt';
+
+const codexTitleMapCache = {
+  titles: {},
+  sourceDbPath: null,
+  lastSyncedAt: null,
+  loadedFrom: null
+};
+
+function getVsCodeStateDbCandidatePaths() {
+  const homeDir = os.homedir();
+  const candidates = [];
+
+  if (process.platform === 'win32') {
+    if (process.env.APPDATA) {
+      candidates.push(path.join(process.env.APPDATA, 'Code', 'User', 'globalStorage', 'state.vscdb'));
+    }
+    candidates.push(path.join(homeDir, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'state.vscdb'));
+  } else if (process.platform === 'darwin') {
+    candidates.push(path.join(homeDir, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'state.vscdb'));
+  } else {
+    candidates.push(path.join(homeDir, '.config', 'Code', 'User', 'globalStorage', 'state.vscdb'));
+  }
+
+  return Array.from(new Set(candidates.map((candidatePath) => path.resolve(candidatePath))));
+}
+
+function normalizeCodexTitleMap(rawTitles) {
+  if (!rawTitles || typeof rawTitles !== 'object') {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [sessionId, title] of Object.entries(rawTitles)) {
+    if (typeof sessionId !== 'string' || typeof title !== 'string') {
+      continue;
+    }
+
+    const normalizedSessionId = sessionId.trim();
+    if (!normalizedSessionId) {
+      continue;
+    }
+
+    if (!title.trim()) {
+      continue;
+    }
+
+    normalized[normalizedSessionId] = title;
+  }
+
+  return normalized;
+}
+
+async function readVsCodeThreadTitlesFromDb() {
+  const candidatePaths = getVsCodeStateDbCandidatePaths();
+  let sourceDbPath = null;
+
+  for (const candidatePath of candidatePaths) {
+    try {
+      await fs.access(candidatePath);
+      sourceDbPath = candidatePath;
+      break;
+    } catch (error) {
+      // Ignore missing candidate
+    }
+  }
+
+  if (!sourceDbPath) {
+    return {
+      success: false,
+      titles: {},
+      sourceDbPath: null,
+      error: `VS Code state DB not found. Checked: ${candidatePaths.join(', ')}`
+    };
+  }
+
+  let db = null;
+  try {
+    db = await open({
+      filename: sourceDbPath,
+      driver: sqlite3.Database,
+      mode: sqlite3.OPEN_READONLY
+    });
+
+    const row = await db.get(
+      'SELECT value FROM ItemTable WHERE key = ? LIMIT 1',
+      [CODEX_VSCODE_STATE_KEY]
+    );
+
+    if (!row || row.value === undefined || row.value === null) {
+      return {
+        success: false,
+        titles: {},
+        sourceDbPath,
+        error: `Key '${CODEX_VSCODE_STATE_KEY}' not found in ItemTable`
+      };
+    }
+
+    const rawValue = Buffer.isBuffer(row.value)
+      ? row.value.toString('utf8')
+      : String(row.value);
+    const parsedValue = JSON.parse(rawValue);
+    const titles = normalizeCodexTitleMap(parsedValue?.['thread-titles']?.titles);
+
+    return {
+      success: true,
+      titles,
+      sourceDbPath,
+      error: null
+    };
+  } catch (error) {
+    return {
+      success: false,
+      titles: {},
+      sourceDbPath,
+      error: error.message
+    };
+  } finally {
+    if (db) {
+      try {
+        await db.close();
+      } catch (closeError) {
+        // Ignore close errors
+      }
+    }
+  }
+}
+
+async function loadPersistedCodexTitleMap() {
+  try {
+    const raw = await fs.readFile(CODEX_TITLE_MAP_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    const titles = normalizeCodexTitleMap(parsed?.titles || parsed);
+
+    return {
+      success: true,
+      titles,
+      sourceDbPath: parsed?.source?.dbPath || null,
+      error: null
+    };
+  } catch (error) {
+    return {
+      success: false,
+      titles: {},
+      sourceDbPath: null,
+      error: error.message
+    };
+  }
+}
+
+async function savePersistedCodexTitleMap(titleMap, sourceDbPath = null) {
+  const normalizedTitles = normalizeCodexTitleMap(titleMap);
+  await fs.mkdir(CLOUDCLI_DIR, { recursive: true });
+
+  const payload = {
+    version: CODEX_TITLE_MAP_VERSION,
+    updatedAt: new Date().toISOString(),
+    source: {
+      dbPath: sourceDbPath
+    },
+    titles: normalizedTitles
+  };
+
+  const tempPath = `${CODEX_TITLE_MAP_PATH}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(payload, null, 2), 'utf8');
+  await fs.rename(tempPath, CODEX_TITLE_MAP_PATH);
+}
+
+async function syncCodexTitleMap(options = {}) {
+  const { force = false } = options;
+  if (!force && codexTitleMapCache.lastSyncedAt) {
+    return codexTitleMapCache.titles || {};
+  }
+
+  const vscodeResult = await readVsCodeThreadTitlesFromDb();
+  if (vscodeResult.success) {
+    codexTitleMapCache.titles = vscodeResult.titles;
+    codexTitleMapCache.sourceDbPath = vscodeResult.sourceDbPath;
+    codexTitleMapCache.lastSyncedAt = new Date().toISOString();
+    codexTitleMapCache.loadedFrom = 'vscode-db';
+
+    try {
+      await savePersistedCodexTitleMap(vscodeResult.titles, vscodeResult.sourceDbPath);
+    } catch (persistError) {
+      console.warn('Could not persist Codex title map:', persistError.message);
+    }
+
+    return codexTitleMapCache.titles;
+  }
+
+  const persistedResult = await loadPersistedCodexTitleMap();
+  if (persistedResult.success) {
+    codexTitleMapCache.titles = persistedResult.titles;
+    codexTitleMapCache.sourceDbPath = persistedResult.sourceDbPath;
+    codexTitleMapCache.lastSyncedAt = new Date().toISOString();
+    codexTitleMapCache.loadedFrom = 'persisted-file';
+    return codexTitleMapCache.titles;
+  }
+
+  codexTitleMapCache.titles = {};
+  codexTitleMapCache.sourceDbPath = null;
+  codexTitleMapCache.lastSyncedAt = new Date().toISOString();
+  codexTitleMapCache.loadedFrom = 'none';
+  return codexTitleMapCache.titles;
+}
+
+async function primeCodexTitleMap() {
+  await syncCodexTitleMap({ force: true });
+}
 
 // Clear cache when needed (called when project files change)
 function clearProjectDirectoryCache() {
@@ -1388,6 +1601,7 @@ async function findCodexJsonlFiles(dir) {
 async function buildCodexSessionsIndex() {
   const codexSessionsDir = path.join(os.homedir(), '.codex', 'sessions');
   const sessionsByProject = new Map();
+  const titleMap = await syncCodexTitleMap({ force: true });
 
   try {
     await fs.access(codexSessionsDir);
@@ -1399,7 +1613,7 @@ async function buildCodexSessionsIndex() {
 
   for (const filePath of jsonlFiles) {
     try {
-      const sessionData = await parseCodexSessionFile(filePath);
+      const sessionData = await parseCodexSessionFile(filePath, { titleMap });
       if (!sessionData || !sessionData.id) {
         continue;
       }
@@ -1453,7 +1667,7 @@ async function getCodexSessions(projectPath, options = {}) {
     const sessionsByProject = indexRef?.sessionsByProject || await buildCodexSessionsIndex();
     const sessions = sessionsByProject.get(normalizedProjectPath) || [];
 
-    // Return limited sessions for performance (0 = unlimited for deletion)
+    // Return limited sessions for performance (0 = unlimited)
     return limit > 0 ? sessions.slice(0, limit) : [...sessions];
 
   } catch (error) {
@@ -1463,7 +1677,8 @@ async function getCodexSessions(projectPath, options = {}) {
 }
 
 // Parse a Codex session JSONL file to extract metadata
-async function parseCodexSessionFile(filePath) {
+async function parseCodexSessionFile(filePath, options = {}) {
+  const { titleMap = {} } = options;
   try {
     const fileStream = fsSync.createReadStream(filePath);
     const rl = readline.createInterface({
@@ -1473,7 +1688,7 @@ async function parseCodexSessionFile(filePath) {
 
     let sessionMeta = null;
     let lastTimestamp = null;
-    let lastUserMessage = null;
+    let firstUserMessage = null;
     let messageCount = 0;
 
     for await (const line of rl) {
@@ -1500,8 +1715,8 @@ async function parseCodexSessionFile(filePath) {
           // Count messages and extract user messages for summary
           if (entry.type === 'event_msg' && entry.payload?.type === 'user_message') {
             messageCount++;
-            if (entry.payload.message) {
-              lastUserMessage = entry.payload.message;
+            if (!firstUserMessage && entry.payload.message) {
+              firstUserMessage = String(entry.payload.message);
             }
           }
 
@@ -1516,12 +1731,19 @@ async function parseCodexSessionFile(filePath) {
     }
 
     if (sessionMeta) {
+      const mappedTitle = sessionMeta.id && typeof titleMap[sessionMeta.id] === 'string'
+        ? titleMap[sessionMeta.id]
+        : null;
+      const fallbackMessage = firstUserMessage
+        ? (firstUserMessage.length > CODEX_SUMMARY_MAX_LENGTH
+          ? firstUserMessage.substring(0, CODEX_SUMMARY_MAX_LENGTH) + '...'
+          : firstUserMessage)
+        : null;
+
       return {
         ...sessionMeta,
         timestamp: lastTimestamp || sessionMeta.timestamp,
-        summary: lastUserMessage ?
-          (lastUserMessage.length > 50 ? lastUserMessage.substring(0, 50) + '...' : lastUserMessage) :
-          'Codex Session',
+        summary: mappedTitle || fallbackMessage || 'Codex Session',
         messageCount
       };
     }
@@ -1820,6 +2042,7 @@ export {
   saveProjectConfig,
   extractProjectDirectory,
   clearProjectDirectoryCache,
+  primeCodexTitleMap,
   getCodexSessions,
   getCodexSessionMessages,
   deleteCodexSession
