@@ -61,9 +61,11 @@ import projectsRoutes, { WORKSPACES_ROOT, validateWorkspacePath } from './routes
 import cliAuthRoutes from './routes/cli-auth.js';
 import userRoutes from './routes/user.js';
 import codexRoutes from './routes/codex.js';
+import notificationsRoutes from './routes/notifications.js';
 import { initializeDatabase } from './database/db.js';
 import { validateApiKey, authenticateToken, authenticateWebSocket } from './middleware/auth.js';
 import { IS_PLATFORM } from './constants/config.js';
+import { sendPushNotificationToUser } from './notifications/push-service.js';
 
 // File system watchers for provider project/session folders
 const PROVIDER_WATCH_PATHS = [
@@ -85,6 +87,94 @@ let projectsWatchers = [];
 let projectsWatcherDebounceTimer = null;
 const connectedClients = new Set();
 let isGetProjectsRunning = false; // Flag to prevent reentrant calls
+const PRESENCE_STALE_MS = 60 * 1000;
+const chatPresenceByKey = new Map();
+const socketPresenceKeys = new WeakMap();
+
+function buildPresenceKey(userId, clientId) {
+    return `${userId}:${clientId}`;
+}
+
+function pruneStalePresenceEntries() {
+    const now = Date.now();
+    for (const [key, entry] of chatPresenceByKey.entries()) {
+        if (now - entry.lastSeenAt > PRESENCE_STALE_MS) {
+            chatPresenceByKey.delete(key);
+        }
+    }
+}
+
+function updateChatPresence(ws, userId, payload = {}) {
+    if (!ws || !userId || !payload?.clientId) {
+        return;
+    }
+
+    const presenceKey = buildPresenceKey(userId, payload.clientId);
+    const visibility = payload.visibility === 'visible' ? 'visible' : 'hidden';
+
+    const presenceEntry = {
+        userId,
+        clientId: payload.clientId,
+        provider: payload.provider || 'codex',
+        sessionId: payload.sessionId || null,
+        visibility,
+        focused: Boolean(payload.focused),
+        lastSeenAt: Date.now(),
+    };
+
+    chatPresenceByKey.set(presenceKey, presenceEntry);
+
+    let keySet = socketPresenceKeys.get(ws);
+    if (!keySet) {
+        keySet = new Set();
+        socketPresenceKeys.set(ws, keySet);
+    }
+    keySet.add(presenceKey);
+}
+
+function clearSocketPresence(ws) {
+    const keySet = socketPresenceKeys.get(ws);
+    if (!keySet) {
+        return;
+    }
+    keySet.forEach((key) => {
+        chatPresenceByKey.delete(key);
+    });
+    socketPresenceKeys.delete(ws);
+}
+
+function isSessionActivelyViewedByUser(userId, provider, sessionId) {
+    if (!userId || !sessionId) {
+        return false;
+    }
+
+    pruneStalePresenceEntries();
+
+    for (const entry of chatPresenceByKey.values()) {
+        if (
+            entry.userId === userId &&
+            entry.provider === provider &&
+            entry.sessionId === sessionId &&
+            entry.visibility === 'visible' &&
+            entry.focused
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function buildNotificationPreview(text = '', maxLength = 180) {
+    const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+        return '';
+    }
+    if (normalized.length <= maxLength) {
+        return normalized;
+    }
+    return `${normalized.slice(0, maxLength - 1)}…`;
+}
 
 // Broadcast progress to all connected WebSocket clients
 function broadcastProgress(progress) {
@@ -378,6 +468,9 @@ app.use('/api/user', authenticateToken, userRoutes);
 
 // Codex API Routes (protected)
 app.use('/api/codex', authenticateToken, codexRoutes);
+
+// Notifications API Routes (protected)
+app.use('/api/notifications', authenticateToken, notificationsRoutes);
 
 // Agent API Routes (uses API key authentication)
 app.use('/api/agent', agentRoutes);
@@ -888,7 +981,7 @@ wss.on('connection', (ws, request) => {
     if (pathname === '/shell') {
         handleShellConnection(ws);
     } else if (pathname === '/ws') {
-        handleChatConnection(ws);
+        handleChatConnection(ws, request?.user || null);
     } else {
         console.log('[WARN] Unknown WebSocket path:', pathname);
         ws.close();
@@ -922,7 +1015,7 @@ class WebSocketWriter {
 }
 
 // Handle chat WebSocket connections
-function handleChatConnection(ws) {
+function handleChatConnection(ws, user = null) {
     console.log('[INFO] Chat WebSocket connected');
 
     // Add to connected clients for project updates
@@ -953,7 +1046,66 @@ function handleChatConnection(ws) {
                 console.log('📁 Project:', data.options?.projectPath || data.options?.cwd || 'Unknown');
                 console.log('🔄 Session:', data.options?.sessionId ? 'Resume' : 'New');
                 console.log('🤖 Model:', data.options?.model || 'default');
-                await queryCodex(data.command, data.options, writer);
+                const codexProjectPath = data.options?.projectPath || data.options?.cwd || null;
+                const codexUserId = user?.userId || user?.id || null;
+
+                const notificationHooks = codexUserId
+                    ? {
+                        onTurnCompleted: async ({ sessionId, assistantText, projectPath }) => {
+                            if (!sessionId) {
+                                return;
+                            }
+                            if (isSessionActivelyViewedByUser(codexUserId, 'codex', sessionId)) {
+                                return;
+                            }
+
+                            const preview = buildNotificationPreview(assistantText);
+                            const body = preview || 'Codex is waiting for your input.';
+
+                            await sendPushNotificationToUser(codexUserId, {
+                                title: 'Codex needs your input',
+                                body,
+                                eventType: 'codex_needs_input',
+                                provider: 'codex',
+                                sessionId,
+                                projectPath: projectPath || codexProjectPath,
+                                url: `/session/${encodeURIComponent(sessionId)}`,
+                                timestamp: new Date().toISOString(),
+                            });
+                        },
+                        onRunCompleted: async ({ sessionId, askedQuestion, assistantText, projectPath }) => {
+                            if (!sessionId || askedQuestion) {
+                                return;
+                            }
+                            if (isSessionActivelyViewedByUser(codexUserId, 'codex', sessionId)) {
+                                return;
+                            }
+
+                            const preview = buildNotificationPreview(assistantText);
+                            const body = preview || 'A background Codex run has completed.';
+
+                            await sendPushNotificationToUser(codexUserId, {
+                                title: 'Codex finished',
+                                body,
+                                eventType: 'codex_finished',
+                                provider: 'codex',
+                                sessionId,
+                                projectPath: projectPath || codexProjectPath,
+                                url: `/session/${encodeURIComponent(sessionId)}`,
+                                timestamp: new Date().toISOString(),
+                            });
+                        },
+                    }
+                    : null;
+
+                await queryCodex(
+                    data.command,
+                    {
+                        ...data.options,
+                        notificationHooks,
+                    },
+                    writer,
+                );
             } else if (data.type === 'cursor-resume') {
                 // Backward compatibility: treat as cursor-command with resume and no prompt
                 console.log('[DEBUG] Cursor resume session (compat):', data.sessionId);
@@ -1035,6 +1187,11 @@ function handleChatConnection(ws) {
                     type: 'active-sessions',
                     sessions: activeSessions
                 });
+            } else if (data.type === 'presence:update' || data.type === 'presence:heartbeat') {
+                const userId = user?.userId || user?.id || null;
+                if (userId && data.provider === 'codex') {
+                    updateChatPresence(ws, userId, data);
+                }
             }
         } catch (error) {
             console.error('[ERROR] Chat WebSocket error:', error.message);
@@ -1049,6 +1206,7 @@ function handleChatConnection(ws) {
         console.log('🔌 Chat client disconnected');
         // Remove from connected clients
         connectedClients.delete(ws);
+        clearSocketPresence(ws);
     });
 }
 
@@ -1917,7 +2075,6 @@ async function startServer() {
     try {
         // Initialize authentication database
         await initializeDatabase();
-
         // Check if running in production mode (dist folder exists)
         const distIndexPath = path.join(__dirname, '../dist/index.html');
         const isProduction = fs.existsSync(distIndexPath);

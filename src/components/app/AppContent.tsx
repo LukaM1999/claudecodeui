@@ -10,6 +10,7 @@ import { useWebSocket } from '../../contexts/WebSocketContext';
 import { useDeviceSettings } from '../../hooks/useDeviceSettings';
 import { useSessionProtection } from '../../hooks/useSessionProtection';
 import { useProjectsState } from '../../hooks/useProjectsState';
+import { usePushNotifications } from '../../hooks/usePushNotifications';
 
 export default function AppContent() {
   const navigate = useNavigate();
@@ -17,6 +18,7 @@ export default function AppContent() {
   const { t } = useTranslation('common');
   const { isMobile } = useDeviceSettings({ trackPWA: false });
   const { ws, sendMessage, latestMessage } = useWebSocket();
+  usePushNotifications();
 
   const {
     activeSessions,

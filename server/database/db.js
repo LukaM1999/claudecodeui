@@ -91,6 +91,26 @@ const runMigrations = () => {
       db.exec('ALTER TABLE users ADD COLUMN has_completed_onboarding BOOLEAN DEFAULT 0');
     }
 
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        endpoint TEXT UNIQUE NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        user_agent TEXT,
+        platform TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_success_at DATETIME,
+        last_error TEXT,
+        is_active BOOLEAN DEFAULT 1,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_id ON push_subscriptions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_active ON push_subscriptions(is_active);
+    `);
+
     console.log('Database migrations completed successfully');
   } catch (error) {
     console.error('Error running migrations:', error.message);
@@ -348,6 +368,99 @@ const credentialsDb = {
   }
 };
 
+// Push subscriptions database operations for Web Push notifications
+const pushSubscriptionsDb = {
+  upsertSubscription: (userId, subscription, metadata = {}) => {
+    try {
+      if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+        throw new Error('Invalid push subscription payload');
+      }
+
+      const stmt = db.prepare(`
+        INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent, platform, is_active, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(endpoint) DO UPDATE SET
+          user_id = excluded.user_id,
+          p256dh = excluded.p256dh,
+          auth = excluded.auth,
+          user_agent = excluded.user_agent,
+          platform = excluded.platform,
+          is_active = 1,
+          updated_at = CURRENT_TIMESTAMP
+      `);
+
+      const result = stmt.run(
+        userId,
+        subscription.endpoint,
+        subscription.keys.p256dh,
+        subscription.keys.auth,
+        metadata.userAgent || null,
+        metadata.platform || null,
+      );
+
+      return { id: result.lastInsertRowid, endpoint: subscription.endpoint };
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  getActiveSubscriptions: (userId) => {
+    try {
+      return db.prepare(`
+        SELECT id, endpoint, p256dh, auth
+        FROM push_subscriptions
+        WHERE user_id = ? AND is_active = 1
+      `).all(userId);
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  deleteSubscriptionByEndpoint: (userId, endpoint) => {
+    try {
+      const stmt = db.prepare('DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?');
+      const result = stmt.run(userId, endpoint);
+      return result.changes > 0;
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  deleteSubscriptionById: (id) => {
+    try {
+      const stmt = db.prepare('DELETE FROM push_subscriptions WHERE id = ?');
+      const result = stmt.run(id);
+      return result.changes > 0;
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  markDeliverySuccess: (id) => {
+    try {
+      db.prepare(`
+        UPDATE push_subscriptions
+        SET last_success_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(id);
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  markDeliveryError: (id, errorMessage) => {
+    try {
+      db.prepare(`
+        UPDATE push_subscriptions
+        SET last_error = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(errorMessage || null, id);
+    } catch (err) {
+      throw err;
+    }
+  }
+};
+
 // Backward compatibility - keep old names pointing to new system
 const githubTokensDb = {
   createGithubToken: (userId, tokenName, githubToken, description = null) => {
@@ -373,5 +486,6 @@ export {
   userDb,
   apiKeysDb,
   credentialsDb,
+  pushSubscriptionsDb,
   githubTokensDb // Backward compatibility
 };

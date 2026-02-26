@@ -18,6 +18,14 @@ import { Codex } from '@openai/codex-sdk';
 // Track active sessions
 const activeCodexSessions = new Map();
 
+function looksLikeQuestion(text = '') {
+  const normalized = String(text || '').trim();
+  if (!normalized) {
+    return false;
+  }
+  return /[?？]/.test(normalized);
+}
+
 /**
  * Transform Codex SDK event to WebSocket message format
  * @param {object} event - SDK event
@@ -194,7 +202,8 @@ export async function queryCodex(command, options = {}, ws) {
     cwd,
     projectPath,
     model,
-    permissionMode = 'default'
+    permissionMode = 'default',
+    notificationHooks = null
   } = options;
 
   const workingDirectory = cwd || projectPath || process.cwd();
@@ -204,6 +213,8 @@ export async function queryCodex(command, options = {}, ws) {
   let thread;
   let currentSessionId = sessionId;
   const abortController = new AbortController();
+  let lastAssistantMessageForTurn = '';
+  let lastTurnAskedQuestion = false;
 
   try {
     // Initialize Codex SDK
@@ -256,6 +267,19 @@ export async function queryCodex(command, options = {}, ws) {
         break;
       }
 
+      if (event.type === 'turn.started') {
+        lastAssistantMessageForTurn = '';
+        lastTurnAskedQuestion = false;
+      }
+
+      if (
+        event.type === 'item.completed' &&
+        event.item?.type === 'agent_message' &&
+        typeof event.item.text === 'string'
+      ) {
+        lastAssistantMessageForTurn = event.item.text;
+      }
+
       if (event.type === 'item.started' || event.type === 'item.updated') {
         continue;
       }
@@ -280,6 +304,24 @@ export async function queryCodex(command, options = {}, ws) {
           sessionId: currentSessionId
         });
       }
+
+      if (event.type === 'turn.completed') {
+        const askedQuestion = looksLikeQuestion(lastAssistantMessageForTurn);
+        lastTurnAskedQuestion = askedQuestion;
+
+        if (askedQuestion && typeof notificationHooks?.onTurnCompleted === 'function') {
+          try {
+            await notificationHooks.onTurnCompleted({
+              sessionId: currentSessionId,
+              threadId: thread?.id || null,
+              assistantText: lastAssistantMessageForTurn,
+              projectPath: workingDirectory,
+            });
+          } catch (error) {
+            console.warn('[Codex] Turn-complete notification hook failed:', error?.message || error);
+          }
+        }
+      }
     }
 
     // Send completion event
@@ -288,6 +330,20 @@ export async function queryCodex(command, options = {}, ws) {
       sessionId: currentSessionId,
       actualSessionId: thread.id
     });
+
+    if (typeof notificationHooks?.onRunCompleted === 'function') {
+      try {
+        await notificationHooks.onRunCompleted({
+          sessionId: currentSessionId,
+          threadId: thread?.id || null,
+          askedQuestion: lastTurnAskedQuestion,
+          assistantText: lastAssistantMessageForTurn,
+          projectPath: workingDirectory,
+        });
+      } catch (error) {
+        console.warn('[Codex] Run-complete notification hook failed:', error?.message || error);
+      }
+    }
 
   } catch (error) {
     const session = currentSessionId ? activeCodexSessions.get(currentSessionId) : null;

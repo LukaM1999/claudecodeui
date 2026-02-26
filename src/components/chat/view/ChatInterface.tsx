@@ -9,6 +9,7 @@ import { useChatProviderState } from '../hooks/useChatProviderState';
 import { useChatSessionState } from '../hooks/useChatSessionState';
 import { useChatRealtimeHandlers } from '../hooks/useChatRealtimeHandlers';
 import { useChatComposerState } from '../hooks/useChatComposerState';
+import { useCodexPresence } from '../hooks/useCodexPresence';
 import type { Provider } from '../types/types';
 
 type PendingViewSession = {
@@ -217,6 +218,14 @@ function ChatInterface({
     onSessionNotProcessing,
     onReplaceTemporarySession,
     onNavigateToSession,
+  });
+
+  useCodexPresence({
+    ws,
+    sendMessage,
+    provider,
+    currentSessionId,
+    selectedSession,
   });
 
   useEffect(() => {
