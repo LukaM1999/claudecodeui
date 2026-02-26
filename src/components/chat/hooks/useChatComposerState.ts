@@ -627,7 +627,7 @@ export function useChatComposerState({
             sessionId: effectiveSessionId,
             resume: Boolean(effectiveSessionId),
             model: codexModel,
-            permissionMode: permissionMode === 'plan' ? 'default' : permissionMode,
+            permissionMode,
           },
         });
       } else {

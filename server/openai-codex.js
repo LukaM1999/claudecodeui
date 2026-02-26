@@ -17,6 +17,24 @@ import { Codex } from '@openai/codex-sdk';
 
 // Track active sessions
 const activeCodexSessions = new Map();
+const PLAN_MODE_FORBIDDEN_ITEM_TYPES = new Set(['command_execution', 'file_change', 'mcp_tool_call']);
+
+function buildCodexPlanModePrompt(userPrompt = '') {
+  const planInstructions = [
+    'You are running in strict Plan Mode.',
+    'Do not run commands.',
+    'Do not modify files.',
+    'Do not call MCP tools.',
+    'Return only a concrete implementation plan that can be executed later.',
+  ].join('\n');
+
+  const normalizedPrompt = String(userPrompt || '').trim();
+  if (!normalizedPrompt) {
+    return `${planInstructions}\n\nUser request:\n(Empty request)`;
+  }
+
+  return `${planInstructions}\n\nUser request:\n${normalizedPrompt}`;
+}
 
 function looksLikeQuestion(text = '') {
   const normalized = String(text || '').trim();
@@ -171,6 +189,11 @@ function transformCodexEvent(event) {
  */
 function mapPermissionModeToCodexOptions(permissionMode) {
   switch (permissionMode) {
+    case 'plan':
+      return {
+        sandboxMode: 'read-only',
+        approvalPolicy: 'untrusted'
+      };
     case 'acceptEdits':
       return {
         sandboxMode: 'workspace-write',
@@ -208,6 +231,7 @@ export async function queryCodex(command, options = {}, ws) {
 
   const workingDirectory = cwd || projectPath || process.cwd();
   const { sandboxMode, approvalPolicy } = mapPermissionModeToCodexOptions(permissionMode);
+  const isPlanMode = permissionMode === 'plan';
 
   let codex;
   let thread;
@@ -215,6 +239,7 @@ export async function queryCodex(command, options = {}, ws) {
   const abortController = new AbortController();
   let lastAssistantMessageForTurn = '';
   let lastTurnAskedQuestion = false;
+  let planModeViolationMessage = null;
 
   try {
     // Initialize Codex SDK
@@ -256,7 +281,8 @@ export async function queryCodex(command, options = {}, ws) {
     });
 
     // Execute with streaming
-    const streamedTurn = await thread.runStreamed(command, {
+    const promptForRun = isPlanMode ? buildCodexPlanModePrompt(command) : command;
+    const streamedTurn = await thread.runStreamed(promptForRun, {
       signal: abortController.signal
     });
 
@@ -270,6 +296,31 @@ export async function queryCodex(command, options = {}, ws) {
       if (event.type === 'turn.started') {
         lastAssistantMessageForTurn = '';
         lastTurnAskedQuestion = false;
+      }
+
+      if (
+        isPlanMode &&
+        event.type.startsWith('item.') &&
+        PLAN_MODE_FORBIDDEN_ITEM_TYPES.has(event.item?.type)
+      ) {
+        planModeViolationMessage = `Codex Plan Mode violation: attempted ${event.item.type}. This run was aborted because Plan Mode is planning-only.`;
+
+        if (session) {
+          session.status = 'aborted';
+        }
+
+        try {
+          abortController.abort();
+        } catch (abortError) {
+          // Ignore abort failures
+        }
+
+        sendMessage(ws, {
+          type: 'codex-error',
+          error: planModeViolationMessage,
+          sessionId: currentSessionId
+        });
+        break;
       }
 
       if (
@@ -324,24 +375,26 @@ export async function queryCodex(command, options = {}, ws) {
       }
     }
 
-    // Send completion event
-    sendMessage(ws, {
-      type: 'codex-complete',
-      sessionId: currentSessionId,
-      actualSessionId: thread.id
-    });
+    if (!planModeViolationMessage) {
+      // Send completion event
+      sendMessage(ws, {
+        type: 'codex-complete',
+        sessionId: currentSessionId,
+        actualSessionId: thread.id
+      });
 
-    if (typeof notificationHooks?.onRunCompleted === 'function') {
-      try {
-        await notificationHooks.onRunCompleted({
-          sessionId: currentSessionId,
-          threadId: thread?.id || null,
-          askedQuestion: lastTurnAskedQuestion,
-          assistantText: lastAssistantMessageForTurn,
-          projectPath: workingDirectory,
-        });
-      } catch (error) {
-        console.warn('[Codex] Run-complete notification hook failed:', error?.message || error);
+      if (typeof notificationHooks?.onRunCompleted === 'function') {
+        try {
+          await notificationHooks.onRunCompleted({
+            sessionId: currentSessionId,
+            threadId: thread?.id || null,
+            askedQuestion: lastTurnAskedQuestion,
+            assistantText: lastAssistantMessageForTurn,
+            projectPath: workingDirectory,
+          });
+        } catch (error) {
+          console.warn('[Codex] Run-complete notification hook failed:', error?.message || error);
+        }
       }
     }
 
