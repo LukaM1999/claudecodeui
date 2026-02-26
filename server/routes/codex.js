@@ -52,13 +52,14 @@ router.get('/config', async (req, res) => {
 
 router.get('/sessions', async (req, res) => {
   try {
-    const { projectPath } = req.query;
+    const { projectPath, limit } = req.query;
 
     if (!projectPath) {
       return res.status(400).json({ success: false, error: 'projectPath query parameter required' });
     }
 
-    const sessions = await getCodexSessions(projectPath);
+    const parsedLimit = Number.isFinite(Number(limit)) ? parseInt(limit, 10) : 0;
+    const sessions = await getCodexSessions(projectPath, { limit: parsedLimit });
     res.json({ success: true, sessions });
   } catch (error) {
     console.error('Error fetching Codex sessions:', error);

@@ -1653,7 +1653,7 @@ async function buildCodexSessionsIndex() {
 
 // Fetch Codex sessions for a given project path
 async function getCodexSessions(projectPath, options = {}) {
-  const { limit = 5, indexRef = null } = options;
+  const { limit = 0, indexRef = null } = options;
   try {
     const normalizedProjectPath = normalizeComparablePath(projectPath);
     if (!normalizedProjectPath) {
