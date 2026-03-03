@@ -603,6 +603,10 @@ async function queryClaudeSDK(command, options = {}, ws) {
 
       // Extract and send token budget updates from result messages
       if (message.type === 'result') {
+        const models = Object.keys(message.modelUsage || {});
+        if (models.length > 0) {
+          console.log("---> Model was sent using:", models);
+        }
         const tokenBudget = extractTokenBudget(message);
         if (tokenBudget) {
           console.log('Token budget from modelUsage:', tokenBudget);
